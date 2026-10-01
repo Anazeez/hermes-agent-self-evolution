@@ -32,6 +32,13 @@ class EvolutionConfig:
     max_param_desc_size: int = 200  # chars
     max_prompt_growth: float = 0.2  # 20% max growth over baseline
 
+    # Semantic preservation: evolved text must retain a minimum share of the
+    # baseline's content vocabulary, so a skill cannot drift into a different
+    # domain (PLAN.md guardrail #4). Deterministic and free -- it is a drift
+    # gate, not a quality score; see constraints._check_semantic_preservation.
+    semantic_preservation_enabled: bool = True
+    min_semantic_similarity: float = 0.5  # fraction of baseline content terms that must survive
+
     # Eval dataset
     eval_dataset_size: int = 20  # Total examples to generate
     train_ratio: float = 0.5

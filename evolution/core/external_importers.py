@@ -131,6 +131,39 @@ def _validate_eval_example(
     }
 
 
+def _skill_summary(skill_name: str, skill_text: str) -> str:
+    """A one-paragraph statement of what the skill does, for the relevance judge.
+
+    The judge must decide whether a task exercises this skill's procedure, not
+    whether it shares vocabulary. Feeding it the raw first 800 chars hands it
+    mostly YAML frontmatter (name, description, tags, related_skills) plus the
+    start of the body — which is how app-reverse-engineering examples that
+    merely mention "gates" and "evidence" were classified relevant. Instead,
+    prefer the frontmatter `description` when it states a purpose, and
+    otherwise fall back to the skill name and a bounded slice of the body.
+
+    Returns a compact, purpose-bearing string.
+    """
+    import re as _re
+
+    # 1. Frontmatter `description:` — usually a purpose statement.
+    fm = _re.match(r"\A---\s*\n(.*?)\n---", skill_text, _re.S)
+    if fm:
+        m = _re.search(r"^description:\s*[\"']?(.+?)[\"']?\s*$", fm.group(1), _re.M)
+        if m and len(m.group(1).strip()) > 10:
+            desc = " ".join(m.group(1).split())[:300]
+            return f"{skill_name}: {desc}"
+
+    # 2. First substantive body heading + sentence, stripped of markup.
+    body = _re.sub(r"\A---\s*\n.*?\n---\s*\n?", "", skill_text, flags=_re.S).strip()
+    body = _re.sub(r"^#.*$", "", body, flags=_re.M).strip()
+    first_line = " ".join(body.split())[:300]
+    if first_line:
+        return f"{skill_name}: {first_line}"
+
+    return skill_name
+
+
 def _is_relevant_to_skill(text: str, skill_name: str, skill_text: str) -> bool:
     """Quick heuristic check if a message might be relevant to a skill.
 
@@ -441,16 +474,25 @@ class RelevanceFilter:
     """
 
     class ScoreRelevance(dspy.Signature):
-        """Score whether a user message is relevant to a specific agent skill.
+        """Decide whether a user message is a real example of the kind of work
+        this skill does, so it can be used as an evaluation example.
+
+        This is NOT a vocabulary match. A message that merely shares words with
+        the skill (\"gate\", \"evidence\", \"verify\") is irrelevant if the actual
+        task is about a different domain. Relevance means: would following this
+        skill's procedure be the correct way to do the task?
 
         Return a JSON object with:
-        - relevant: boolean (true if the message relates to what this skill does)
-        - expected_behavior: string (if relevant, what should a good response do?)
+        - relevant: boolean. True ONLY if the task's central goal is the kind
+          of work this skill's procedure exists to do -- not merely adjacent,
+          not merely using similar language.
+        - expected_behavior: string (if relevant, what should a good response
+          do, in terms of THIS skill's procedure?)
         - difficulty: string (easy, medium, or hard)
         - category: string (what aspect of the skill this tests)
         """
         skill_name: str = dspy.InputField(desc="Name of the skill")
-        skill_description: str = dspy.InputField(desc="First 800 chars of the skill file")
+        skill_description: str = dspy.InputField(desc="What this skill does, in one paragraph")
         user_message: str = dspy.InputField(desc="The user's message to evaluate")
         assistant_response: str = dspy.InputField(desc="The assistant's actual response (may be empty)")
         scoring: str = dspy.OutputField(desc="JSON object with: relevant, expected_behavior, difficulty, category")
@@ -477,7 +519,7 @@ class RelevanceFilter:
         Returns:
             List of EvalExample objects for relevant messages.
         """
-        skill_desc = skill_text[:800]
+        skill_desc = _skill_summary(skill_name, skill_text)
 
         # Stage 0: drop messages missing required fields
         messages = [m for m in messages if m.get("task_input") and m.get("source")]
