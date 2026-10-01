@@ -74,6 +74,11 @@ VALID_DIFFICULTIES = {"easy", "medium", "hard"}
 
 MIN_DATASET_SIZE = 3  # Minimum examples needed to produce a meaningful split
 
+# Below this total the 50/25/25 split yields a holdout too small to support a
+# trustworthy improvement claim. With 20 examples the holdout is 5; with 50 it
+# is ~13. Prefer more examples over a cheaper run.
+RECOMMENDED_DATASET_SIZE = 50
+
 
 def _contains_secret(text: str) -> bool:
     """Check if text contains potential API keys or tokens."""
@@ -633,7 +638,7 @@ def build_dataset_from_external(
     sources: list[str],
     output_path: Path,
     model: str,
-    max_examples: int = 50,
+    max_examples: int = RECOMMENDED_DATASET_SIZE,
 ) -> EvalDataset:
     """Extract messages from external tools, filter for relevance, and save.
 
@@ -765,7 +770,8 @@ def _load_skill_text(skill_name: str, skills_dir: Optional[Path] = None) -> tupl
               help="Output directory (default: datasets/skills/<skill>/)")
 @click.option("--model", default="openrouter/google/gemini-2.5-flash",
               help="LiteLLM model string for relevance scoring")
-@click.option("--max-examples", default=50, help="Max eval examples to generate")
+@click.option("--max-examples", default=RECOMMENDED_DATASET_SIZE,
+              help="Max eval examples to generate")
 @click.option("--dry-run", is_flag=True, help="Show message counts without LLM scoring")
 def main(source, skill, output, model, max_examples, dry_run):
     """Import external session data into golden eval datasets for self-evolution."""

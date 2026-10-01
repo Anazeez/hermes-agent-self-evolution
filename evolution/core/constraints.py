@@ -148,12 +148,35 @@ class ConstraintValidator:
             )
 
     def _check_skill_structure(self, text: str) -> ConstraintResult:
-        """Check that a skill file has valid YAML frontmatter and markdown body."""
-        has_frontmatter = text.strip().startswith("---")
-        has_name = "name:" in text[:500] if has_frontmatter else False
-        has_description = "description:" in text[:500] if has_frontmatter else False
+        """Check that a skill file has valid YAML frontmatter and markdown body.
 
-        if has_frontmatter and has_name and has_description:
+        Accepts either a full skill file (frontmatter + body) or a bare body.
+        A bare body carries no frontmatter by definition, so it is judged on
+        substance alone — otherwise every evolved variant fails this gate,
+        because the caller optimizes the frontmatter-stripped body and only
+        reassembles frontmatter afterwards.
+        """
+        stripped = text.strip()
+
+        if not stripped.startswith("---"):
+            # Frontmatter-stripped body: structure cannot be judged here.
+            # Require real substance instead, so this is not a free pass.
+            if len(stripped) >= 200 and stripped.lstrip().startswith("#"):
+                return ConstraintResult(
+                    passed=True,
+                    constraint_name="skill_structure",
+                    message="Body has a heading and substantive content (frontmatter checked separately)",
+                )
+            return ConstraintResult(
+                passed=False,
+                constraint_name="skill_structure",
+                message="Body lacks frontmatter (expected here) and has no substantive heading content",
+            )
+
+        has_name = "name:" in text[:500]
+        has_description = "description:" in text[:500]
+
+        if has_name and has_description:
             return ConstraintResult(
                 passed=True,
                 constraint_name="skill_structure",
@@ -161,8 +184,6 @@ class ConstraintValidator:
             )
         else:
             missing = []
-            if not has_frontmatter:
-                missing.append("YAML frontmatter (---)")
             if not has_name:
                 missing.append("name field")
             if not has_description:

@@ -42,6 +42,7 @@ from evolution.core.external_importers import (
     RelevanceFilter,
     _contains_secret,
     MIN_DATASET_SIZE,
+    RECOMMENDED_DATASET_SIZE,
 )
 
 console = Console()
@@ -280,7 +281,7 @@ class CodexImporter:
               help="Output directory (default: datasets/skills/<skill>/)")
 @click.option("--model", default="openrouter/google/gemini-2.5-flash",
               help="LiteLLM model string for relevance scoring")
-@click.option("--max-examples", default=50, type=int)
+@click.option("--max-examples", default=RECOMMENDED_DATASET_SIZE, type=int)
 @click.option("--db", type=click.Path(), default=None, help="Override Codex DB path")
 @click.option("--dry-run", is_flag=True, help="Show counts without LLM scoring")
 def main(skill, output, model, max_examples, db, dry_run):

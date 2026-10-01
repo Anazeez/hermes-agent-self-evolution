@@ -21,7 +21,14 @@ from rich.table import Table
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
-from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
+from evolution.core.fitness import (
+    skill_fitness_metric,
+    LLMJudge,
+    FitnessScore,
+    set_current_skill_text,
+    set_llm_judge,
+    get_llm_judge,
+)
 from evolution.core.constraints import ConstraintValidator
 from evolution.skills.skill_module import (
     SkillModule,
@@ -136,6 +143,12 @@ def evolve(
     console.print(f"  Optimizer model: {optimizer_model}")
     console.print(f"  Eval model: {eval_model}")
 
+    # The fitness metric grades output against the skill text the candidate
+    # was actually given. Register a judge bound to this run's eval model and
+    # seed the baseline instructions before the first score.
+    set_llm_judge(LLMJudge(config))
+    set_current_skill_text(skill["body"])
+
     # Configure DSPy
     lm = dspy.LM(eval_model)
     dspy.configure(lm=lm)
@@ -210,16 +223,27 @@ def evolve(
 
     baseline_scores = []
     evolved_scores = []
+    judge_feedback = []
     for ex in holdout_examples:
-        # Score baseline
+        # Score baseline against the baseline instructions...
+        set_current_skill_text(skill["body"])
         with dspy.context(lm=lm):
             baseline_pred = baseline_module(task_input=ex.task_input)
             baseline_score = skill_fitness_metric(ex, baseline_pred)
             baseline_scores.append(baseline_score)
 
+        # ...and the evolved variant against its own. Using one set of
+        # instructions for both would grade half the runs against a rubric
+        # the candidate never saw.
+        set_current_skill_text(evolved_body)
+        with dspy.context(lm=lm):
             evolved_pred = optimized_module(task_input=ex.task_input)
             evolved_score = skill_fitness_metric(ex, evolved_pred)
             evolved_scores.append(evolved_score)
+
+        feedback = getattr(evolved_pred, "feedback", "") or ""
+        if feedback:
+            judge_feedback.append(str(feedback))
 
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
     avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
@@ -279,8 +303,19 @@ def evolve(
         "holdout_examples": len(dataset.holdout),
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
+        "fitness_metric": "llm_judge_composite",
+        "baseline_holdout_scores": baseline_scores,
+        "evolved_holdout_scores": evolved_scores,
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+    # Save judge feedback — this is the only qualitative signal available, and
+    # it is what a human reviewer should read before judging the diff.
+    if judge_feedback:
+        (output_dir / "judge_feedback.md").write_text(
+            "# LLM judge feedback (holdout)\n\n"
+            + "\n\n".join(f"## Example {i + 1}\n{f}" for i, f in enumerate(judge_feedback))
+        )
 
     console.print(f"\n  Output saved to {output_dir}/")
 
