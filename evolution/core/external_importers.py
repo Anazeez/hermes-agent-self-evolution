@@ -25,6 +25,8 @@ Usage from evolve_skill.py:
 import json
 import re
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -78,6 +80,12 @@ MIN_DATASET_SIZE = 3  # Minimum examples needed to produce a meaningful split
 # trustworthy improvement claim. With 20 examples the holdout is 5; with 50 it
 # is ~13. Prefer more examples over a cheaper run.
 RECOMMENDED_DATASET_SIZE = 50
+
+# Concurrent LLM calls during relevance scoring. These are independent
+# reasoning calls against a local router, so they parallelise well; keep it
+# modest to stay under the router's own concurrency limits and avoid
+# saturating the machine.
+_RELEVANCE_CONCURRENCY = 12
 
 
 def _contains_secret(text: str) -> bool:
@@ -493,50 +501,75 @@ class RelevanceFilter:
         console.print(f"  Pre-filtered to {len(candidates)} candidates (from {len(messages)} total)")
 
         # Stage 2: LLM relevance scoring
-        examples = []
+        #
+        # Each candidate is scored independently, so this runs concurrently. A
+        # serial loop here was the pipeline's dominant cost: max_examples*3
+        # candidates (150 by default) each took one full reasoning call, which
+        # put a single run past half an hour before GEPA even started. The
+        # work is embarrassingly parallel, so it now runs on a thread pool.
+        #
+        # One LM per worker thread: the LM carries per-call mutable state and
+        # dspy settings are thread-local, so sharing a single instance across
+        # threads would interleave configuration.
         errors = 0
-        from evolution.skills.evolve_skill import make_lm
-        lm = make_lm(self.model)
+        local = threading.local()
 
+        def _score_one(msg: dict):
+            lm = getattr(local, "lm", None)
+            if lm is None:
+                from evolution.skills.evolve_skill import make_lm
+                lm = make_lm(self.model)
+                local.lm = lm
+            with dspy.context(lm=lm):
+                result = self.scorer(
+                    skill_name=skill_name,
+                    skill_description=skill_desc,
+                    user_message=msg["task_input"][:1000],
+                    assistant_response=msg.get("assistant_response", "")[:1000],
+                )
+            return _parse_scoring_json(result.scoring)
+
+        def _work(msg: dict):
+            """Score one candidate, returning an EvalExample or None."""
+            try:
+                scoring = _score_one(msg)
+            except Exception:
+                return None, True  # (example, is_error)
+
+            if scoring is None:
+                return None, True
+            if not scoring.get("relevant", False):
+                return None, False
+
+            validated = _validate_eval_example(
+                task_input=msg["task_input"],
+                expected_behavior=scoring.get("expected_behavior", ""),
+                difficulty=scoring.get("difficulty", "medium"),
+                category=scoring.get("category", "general"),
+            )
+            if not validated:
+                return None, False
+            return EvalExample(source=msg["source"], **validated), False
+
+        workers = max(1, min(_RELEVANCE_CONCURRENCY, len(candidates)))
+        # Each entry is (EvalExample | None, is_error: bool)
+        scored: list[tuple[Optional[EvalExample], bool]] = []
         with Progress() as progress:
             task = progress.add_task("Scoring relevance...", total=len(candidates))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                # executor.map preserves input order, so the resulting examples
+                # stay deterministic despite the concurrency.
+                for outcome in pool.map(_work, candidates):
+                    scored.append(outcome)
+                    progress.update(task, advance=1)
 
-            for msg in candidates:
-                try:
-                    with dspy.context(lm=lm):
-                        result = self.scorer(
-                            skill_name=skill_name,
-                            skill_description=skill_desc,
-                            user_message=msg["task_input"][:1000],
-                            assistant_response=msg.get("assistant_response", "")[:1000],
-                        )
+        examples = [ex for ex, _ in scored if ex is not None]
+        errors = sum(1 for _, is_err in scored if is_err)
 
-                    scoring = _parse_scoring_json(result.scoring)
-                    if scoring is None:
-                        errors += 1
-                        progress.update(task, advance=1)
-                        continue
-
-                    if scoring.get("relevant", False):
-                        validated = _validate_eval_example(
-                            task_input=msg["task_input"],
-                            expected_behavior=scoring.get("expected_behavior", ""),
-                            difficulty=scoring.get("difficulty", "medium"),
-                            category=scoring.get("category", "general"),
-                        )
-                        if validated:
-                            examples.append(EvalExample(
-                                source=msg["source"],
-                                **validated,
-                            ))
-
-                except Exception:
-                    errors += 1
-
-                progress.update(task, advance=1)
-
-                if len(examples) >= max_examples:
-                    break
+        # Truncate only after all scoring completes: a serial loop could stop
+        # early once it had enough examples, but stopping mid-pool would leave
+        # calls in flight and make the result depend on thread scheduling.
+        examples = examples[:max_examples]
 
         # Report error rate so users know if the LLM is misbehaving
         total_scored = len(candidates)
