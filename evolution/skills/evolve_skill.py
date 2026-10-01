@@ -6,6 +6,7 @@ Usage:
 """
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,7 +19,12 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
+from evolution.core.config import (
+    EvolutionConfig,
+    resolve_hermes_agent_path,
+    local_router_base_url,
+    normalize_model,
+)
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
 from evolution.core.fitness import (
@@ -38,6 +44,25 @@ from evolution.skills.skill_module import (
 )
 
 console = Console()
+
+
+def make_lm(model: str):
+    """Construct a dspy.LM, using the Responses API when a local router exists.
+
+    The codex-router implements /responses only. litellm's default
+    chat-completions path gets `proxy_route_not_found` from it, and DSPy has no
+    way to express that from the CLI, so it is decided here — once — instead of
+    in each caller.
+    """
+    router_base = local_router_base_url()
+    if router_base:
+        return dspy.LM(
+            normalize_model(model),
+            api_base=router_base,
+            api_key=os.getenv("CODEX_ROUTER_KEY", "local"),
+            model_type="responses",
+        )
+    return dspy.LM(model)
 
 
 def evolve(
@@ -62,6 +87,20 @@ def evolve(
         run_pytest=run_tests,
     )
 
+    # The local codex-router serves ONLY /responses, and litellm defaults to
+    # /chat/completions (which the router answers with proxy_route_not_found).
+    # It also hijacks a bare `openrouter/...` prefix and bypasses api_base
+    # entirely. So: normalize the model onto the OpenAI-compatible path and
+    # force the Responses API whenever a local router is available.
+    router_base = local_router_base_url()
+    if router_base:
+        optimizer_model = normalize_model(optimizer_model)
+        eval_model = normalize_model(eval_model)
+        config.optimizer_model = optimizer_model
+        config.eval_model = eval_model
+        config.judge_model = eval_model
+        console.print(f"[dim]Using local codex-router: {router_base}[/dim]")
+
     # ── 1. Find and load the skill ──────────────────────────────────────
     console.print(f"\n[bold cyan]🧬 Hermes Agent Self-Evolution[/bold cyan] — Evolving skill: [bold]{skill_name}[/bold]\n")
 
@@ -71,7 +110,13 @@ def evolve(
         sys.exit(1)
 
     skill = load_skill(skill_path)
-    console.print(f"  Loaded: {skill_path.relative_to(config.hermes_agent_path)}")
+    # Display the path relative to the repo only when it actually lives there;
+    # profile-local skills resolve outside hermes_agent_path and would raise.
+    try:
+        shown_path = skill_path.relative_to(config.hermes_agent_path or Path("/"))
+    except ValueError:
+        shown_path = skill_path
+    console.print(f"  Loaded: {shown_path}")
     console.print(f"  Name: {skill['name']}")
     console.print(f"  Size: {len(skill['raw']):,} chars")
     console.print(f"  Description: {skill['description'][:80]}...")
@@ -150,7 +195,7 @@ def evolve(
     set_current_skill_text(skill["body"])
 
     # Configure DSPy
-    lm = dspy.LM(eval_model)
+    lm = make_lm(eval_model)
     dspy.configure(lm=lm)
 
     # Create the baseline skill module

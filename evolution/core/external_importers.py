@@ -495,7 +495,8 @@ class RelevanceFilter:
         # Stage 2: LLM relevance scoring
         examples = []
         errors = 0
-        lm = dspy.LM(self.model)
+        from evolution.skills.evolve_skill import make_lm
+        lm = make_lm(self.model)
 
         with Progress() as progress:
             task = progress.add_task("Scoring relevance...", total=len(candidates))

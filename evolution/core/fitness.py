@@ -31,6 +31,19 @@ class FitnessScore:
         return max(0.0, raw - self.length_penalty)
 
 
+def _lm_for(model: str):
+    """Build a dspy LM, preferring the Responses API for a local router.
+
+    Imported lazily from evolve_skill to avoid a circular import: that module
+    owns the factory because it is the CLI entrypoint.
+    """
+    try:
+        from evolution.skills.evolve_skill import make_lm
+        return make_lm(model)
+    except Exception:  # noqa: BLE001 - fall back to DSPy's default handling
+        return dspy.LM(model)
+
+
 class LLMJudge:
     """LLM-as-judge scorer with rubric-based evaluation.
 
@@ -72,7 +85,7 @@ class LLMJudge:
     ) -> FitnessScore:
         """Score an agent output using LLM-as-judge."""
 
-        lm = dspy.LM(self.config.eval_model)
+        lm = _lm_for(self.config.eval_model)
 
         with dspy.context(lm=lm):
             result = self.judge(
