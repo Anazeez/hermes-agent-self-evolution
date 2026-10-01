@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import time
+import inspect
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -44,6 +45,11 @@ from evolution.skills.skill_module import (
 )
 
 console = Console()
+
+# Concurrent metric evaluations during optimization. GEPA evaluates a
+# candidate's full valset per step, so this is the optimizer's throughput
+# knob; keep it aligned with the relevance-scoring pool.
+_OPTIMIZER_CONCURRENCY = 12
 
 
 def make_lm(model: str):
@@ -210,23 +216,47 @@ def evolve(
 
     start_time = time.time()
 
-    try:
-        optimizer = dspy.GEPA(
-            metric=skill_fitness_metric,
-            max_steps=iterations,
-        )
+    # GEPA's budget parameter was renamed across DSPy versions: older builds
+    # took max_steps, 3.4.0 takes max_full_evals / max_metric_calls. Passing
+    # max_steps raised TypeError, which the old blanket except swallowed into
+    # a MIPROv2 fallback -- so every run silently used the wrong optimizer and
+    # reported it as a fallback rather than a bug. Introspect instead.
+    gepa_kwargs = {"metric": skill_fitness_metric}
+    gepa_params = inspect.signature(dspy.GEPA.__init__).parameters
+    if "max_steps" in gepa_params:
+        gepa_kwargs["max_steps"] = iterations
+    elif "max_full_evals" in gepa_params:
+        gepa_kwargs["max_full_evals"] = iterations
+    elif "max_metric_calls" in gepa_params:
+        gepa_kwargs["max_metric_calls"] = iterations
+    if "num_threads" in gepa_params:
+        gepa_kwargs["num_threads"] = _OPTIMIZER_CONCURRENCY
+    # Reflection uses the optimizer model to propose mutations. Must be set
+    # BEFORE construction -- adding it to the dict afterwards has no effect on
+    # an already-built optimizer.
+    if "reflection_lm" in gepa_params:
+        gepa_kwargs["reflection_lm"] = make_lm(optimizer_model)
 
+    optimizer = dspy.GEPA(**gepa_kwargs)
+    console.print(
+        f"  [green]Optimizer: GEPA ({iterations} budget, "
+        f"{_OPTIMIZER_CONCURRENCY} threads)[/green]"
+    )
+
+    try:
         optimized_module = optimizer.compile(
             baseline_module,
             trainset=trainset,
             valset=valset,
         )
     except Exception as e:
-        # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
-        console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
+        # Only a compile failure reaches here now; a GEPA construction failure
+        # is a real bug and should surface rather than silently downgrade.
+        console.print(f"[yellow]GEPA compile failed ({e}), falling back to MIPROv2[/yellow]")
         optimizer = dspy.MIPROv2(
             metric=skill_fitness_metric,
             auto="light",
+            num_threads=_OPTIMIZER_CONCURRENCY,
         )
         optimized_module = optimizer.compile(
             baseline_module,
