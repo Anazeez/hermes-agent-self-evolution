@@ -90,9 +90,7 @@ class TestGepaConstruction:
         Setting it on the dict after construction silently does nothing, so
         the mutation proposer would fall back to the task/judge model.
         """
-        import dspy
-
-        source = inspect.getsource(es.evolve)
+        source = inspect.getsource(es.build_gepa_optimizer)
         construct_at = source.index("dspy.GEPA(**gepa_kwargs)")
         reflection_at = source.index('gepa_kwargs["reflection_lm"]')
         assert reflection_at < construct_at, (

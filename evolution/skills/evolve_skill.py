@@ -52,6 +52,77 @@ console = Console()
 _OPTIMIZER_CONCURRENCY = 12
 
 
+def _gepa_metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
+    """Adapt skill_fitness_metric to GEPA's 5-arg metric contract.
+
+    GEPA inspects the metric signature and rejects anything it cannot bind five
+    positional args to. skill_fitness_metric keeps the DSPy-standard
+    (example, prediction, trace=None) shape shared with MIPROv2 and the fitness
+    tests, so the adaptation belongs here rather than in the shared metric.
+    """
+    return skill_fitness_metric(gold, pred, trace)
+
+
+def build_gepa_optimizer(iterations: int, optimizer_model: str):
+    """Construct a GEPA optimizer that matches the installed DSPy signature.
+
+    Three separate defects in this family all surfaced only at runtime, after a
+    full dataset build:
+      1. The budget parameter was renamed (max_steps -> max_full_evals /
+         max_metric_calls), and a blanket except turned the TypeError into a
+         silent MIPROv2 fallback.
+      2. GEPA asserts that reflection_lm was supplied; without it the mutation
+         proposer silently falls back to the task/judge model.
+      3. GEPA binds five positional args against the metric.
+
+    Introspecting the installed signature handles the renamed parameters
+    instead of tracking each rename.
+    """
+    # Explicit annotation: Pyright otherwise infers the value type from the
+    # first assignment (the metric callable) and flags every other kwarg.
+    gepa_kwargs: dict = {"metric": _gepa_metric}
+    params = inspect.signature(dspy.GEPA.__init__).parameters
+
+    if "max_steps" in params:
+        gepa_kwargs["max_steps"] = iterations
+    elif "max_full_evals" in params:
+        gepa_kwargs["max_full_evals"] = iterations
+    elif "max_metric_calls" in params:
+        gepa_kwargs["max_metric_calls"] = iterations
+    else:
+        raise RuntimeError(
+            "Cannot find GEPA's budget parameter in this DSPy version "
+            f"(has: {sorted(params)}). Update build_gepa_optimizer()."
+        )
+
+    if "num_threads" in params:
+        gepa_kwargs["num_threads"] = _OPTIMIZER_CONCURRENCY
+    # Must be set BEFORE construction: adding it to the dict afterwards has no
+    # effect on an already-built optimizer.
+    if "reflection_lm" in params:
+        gepa_kwargs["reflection_lm"] = make_lm(optimizer_model)
+
+    # Construction raises on a bad signature or a missing reflection_lm. Let
+    # it propagate -- do not fall back, or a version mismatch and a real bug
+    # become indistinguishable.
+    return dspy.GEPA(**gepa_kwargs)
+
+
+def preflight_optimizer(iterations: int, optimizer_model: str) -> bool:
+    """Build the optimizer now so signature errors surface in seconds.
+
+    The dataset build costs ~15 minutes of LLM calls; discovering a broken
+    optimizer signature after it is pure waste. Returns False (and explains)
+    rather than raising, so --dry-run and the CLI stay usable.
+    """
+    try:
+        build_gepa_optimizer(iterations, optimizer_model)
+    except Exception as e:
+        console.print(f"  [red]✗ Optimizer preflight failed: {type(e).__name__}: {e}[/red]")
+        return False
+    return True
+
+
 def make_lm(model: str):
     """Construct a dspy.LM, using the Responses API when a local router exists.
 
@@ -133,6 +204,18 @@ def evolve(
         console.print(f"  Would run GEPA optimization ({iterations} iterations)")
         console.print(f"  Would validate constraints and create PR")
         return
+
+    # Construct the optimizer BEFORE the ~15-minute dataset build. Three
+    # separate signature bugs in this path each cost a full build to discover.
+    if not preflight_optimizer(iterations, optimizer_model):
+        console.print(
+            "[red]Aborting before dataset build: fix the optimizer setup above, "
+            "or the mined examples will be wasted.[/red]"
+        )
+        sys.exit(1)
+    console.print(
+        f"  [green]✓ Optimizer preflight passed (GEPA, {iterations} budget)[/green]"
+    )
 
     # ── 2. Build or load evaluation dataset ─────────────────────────────
     console.print(f"\n[bold]Building evaluation dataset[/bold] (source: {eval_source})")
@@ -216,32 +299,7 @@ def evolve(
 
     start_time = time.time()
 
-    # GEPA's budget parameter was renamed across DSPy versions: older builds
-    # took max_steps, 3.4.0 takes max_full_evals / max_metric_calls. Passing
-    # max_steps raised TypeError, which the old blanket except swallowed into
-    # a MIPROv2 fallback -- so every run silently used the wrong optimizer and
-    # reported it as a fallback rather than a bug. Introspect instead.
-    gepa_kwargs = {"metric": skill_fitness_metric}
-    gepa_params = inspect.signature(dspy.GEPA.__init__).parameters
-    if "max_steps" in gepa_params:
-        gepa_kwargs["max_steps"] = iterations
-    elif "max_full_evals" in gepa_params:
-        gepa_kwargs["max_full_evals"] = iterations
-    elif "max_metric_calls" in gepa_params:
-        gepa_kwargs["max_metric_calls"] = iterations
-    if "num_threads" in gepa_params:
-        gepa_kwargs["num_threads"] = _OPTIMIZER_CONCURRENCY
-    # Reflection uses the optimizer model to propose mutations. Must be set
-    # BEFORE construction -- adding it to the dict afterwards has no effect on
-    # an already-built optimizer.
-    if "reflection_lm" in gepa_params:
-        gepa_kwargs["reflection_lm"] = make_lm(optimizer_model)
-
-    optimizer = dspy.GEPA(**gepa_kwargs)
-    console.print(
-        f"  [green]Optimizer: GEPA ({iterations} budget, "
-        f"{_OPTIMIZER_CONCURRENCY} threads)[/green]"
-    )
+    optimizer = build_gepa_optimizer(iterations, optimizer_model)
 
     try:
         optimized_module = optimizer.compile(
