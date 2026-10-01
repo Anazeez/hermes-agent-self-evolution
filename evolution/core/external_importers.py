@@ -600,6 +600,30 @@ def _parse_scoring_json(text: str) -> Optional[dict]:
     return None
 
 
+# ── Codex (optional, lazily loaded) ──────────────────────────────────────
+
+
+def _codex_importer_class():
+    """Load the Codex importer lazily.
+
+    Codex history lives in a separate module because it is an optional
+    dependency on the local `~/.codex` install. Resolving it here keeps the
+    claude-code / copilot / hermes importers usable when Codex is absent.
+    """
+    try:
+        from evolution.core.codex_importer import CodexImporter
+        return CodexImporter
+    except Exception as e:  # noqa: BLE001 - degrade, never break the other sources
+        console.print(f"[yellow]Codex importer unavailable: {e}[/yellow]")
+
+        class _Missing:
+            @staticmethod
+            def extract_messages(limit: int = 0) -> list[dict]:
+                return []
+
+        return _Missing
+
+
 # ── Orchestration ─────────────────────────────────────────────────────────
 
 
@@ -633,6 +657,9 @@ def build_dataset_from_external(
         "claude-code": ("Claude Code", ClaudeCodeImporter),
         "copilot": ("Copilot", CopilotImporter),
         "hermes": ("Hermes Agent", HermesSessionImporter),
+        # Codex importer is imported lazily: it lives in a separate module and
+        # must not be required for the other sources to work.
+        "codex": ("Codex", _codex_importer_class()),
     }
 
     for source in sources:
@@ -729,7 +756,7 @@ def _load_skill_text(skill_name: str, skills_dir: Optional[Path] = None) -> tupl
 @click.command()
 @click.option(
     "--source",
-    type=click.Choice(["claude-code", "copilot", "hermes", "all"]),
+    type=click.Choice(["claude-code", "copilot", "hermes", "codex", "all"]),
     default="all",
     help="Which tool to import from",
 )
@@ -752,13 +779,14 @@ def main(source, skill, output, model, max_examples, dry_run):
 
     console.print(f"  Loaded skill: {skill_name} ({len(skill_text):,} chars)")
 
-    sources = [source] if source != "all" else ["claude-code", "copilot", "hermes"]
+    sources = [source] if source != "all" else ["claude-code", "copilot", "hermes", "codex"]
 
     if dry_run:
         importers = {
             "claude-code": ClaudeCodeImporter,
             "copilot": CopilotImporter,
             "hermes": HermesSessionImporter,
+            "codex": _codex_importer_class(),
         }
         for src in sources:
             msgs = importers[src].extract_messages()

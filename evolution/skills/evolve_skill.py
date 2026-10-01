@@ -87,7 +87,7 @@ def evolve(
         dataset = build_dataset_from_external(
             skill_name=skill_name,
             skill_text=skill["raw"],
-            sources=["claude-code", "copilot", "hermes"],
+            sources=["claude-code", "copilot", "hermes", "codex"],
             output_path=save_path,
             model=eval_model,
         )
